@@ -1605,12 +1605,12 @@ function parseFinlogDate(input) {
       fl.unshift({type:finType,amount:Math.abs(delta),date:new Date().toISOString(),note:note||''});
       // Sadece users/{id}'ye yaz — broker/accounts'a DOKUNMA
       if(typeof db !== 'undefined' && db) {
-        db.collection('users').doc(String(accId)).set({
+        _adCanonWrite(accId, {
           balance: newBal,
           finlog: fl,
           _balanceSource: 'manager',
           updatedAt: new Date().toISOString()
-        }, {merge:true}).catch(function(e){ console.warn('_reqUpdateBalance:', e); });
+        }).catch(function(e){ console.warn('_reqUpdateBalance:', e); });
       }
       if(callback)callback(newBal);
     }
@@ -5329,11 +5329,7 @@ function saveSymbolMgr() {
   // Firebase'e yaz - trader senkron olsun
   if(typeof db !== 'undefined' && db) {
     try {
-      db.collection('broker').doc('symbols').set({
-        data: JSON.stringify(symConfig),
-        deleted: JSON.stringify(_txDeleted),
-        updatedAt: new Date().toISOString()
-      }).catch(function(e){ console.warn('symbols save:', e); });
+      saveSymConfig();   // 2026-11-05: piyasa saati bağlarını koruyan ortak kayıt
     } catch(e){}
   }
   closeAddSymModal();
@@ -6282,12 +6278,12 @@ function adDeposit() {
   // ⚠️ ARTIK a.balance'a ve a.finlog'a dokunmuyoruz — canonical users/{id} tek kaynak
   // Sadece users/{id}'ye yaz; _accCanon listener değişikliği anında yakalar
   if(typeof db !== 'undefined' && db) {
-    db.collection('users').doc(String(a.id)).set({
+    _adCanonWrite(a.id, {
       balance: _newBal,
       finlog: _curFl,
       _balanceSource: 'manager',
       updatedAt: new Date().toISOString()
-    }, {merge:true}).catch(function(e){ console.warn('adDeposit write err:', e); });
+    }).catch(function(e){ console.warn('adDeposit write err:', e); });
   }
   renderAccTable();
   adRenderFinlog();
@@ -6326,12 +6322,12 @@ function adWithdraw() {
   withdrawRequests.unshift(req);
   saveRequests();
   if(typeof db !== 'undefined' && db) {
-    db.collection('users').doc(String(a.id)).set({
+    _adCanonWrite(a.id, {
       balance: _newBal,
       finlog: _curFl,
       _balanceSource: 'manager',
       updatedAt: new Date().toISOString()
-    }, {merge:true}).catch(function(e){ console.warn('adWithdraw write err:', e); });
+    }).catch(function(e){ console.warn('adWithdraw write err:', e); });
   }
   renderAccTable();
   adRenderFinlog();
@@ -6560,13 +6556,13 @@ function adSaveFinlog() {
 
   // ⚠️ SADECE users/{id}'ye yaz — broker/accounts'a DOKUNMA
   if(typeof db !== 'undefined' && db) {
-    db.collection('users').doc(String(a.id)).set({
+    _adCanonWrite(a.id, {
       balance: cBal,
       bonus: cBon,
       finlog: fl,
       _balanceSource: 'manager',
       updatedAt: new Date().toISOString()
-    }, {merge:true}).catch(function(e){ console.warn('adSaveFinlog:', e); });
+    }).catch(function(e){ console.warn('adSaveFinlog:', e); });
   }
 
   document.getElementById('adFinlogForm').style.display = 'none';
@@ -6594,13 +6590,13 @@ function adDeleteFinlog(idx) {
   fl.splice(idx, 1);
 
   if(typeof db !== 'undefined' && db) {
-    db.collection('users').doc(String(a.id)).set({
+    _adCanonWrite(a.id, {
       balance: cBal,
       bonus: cBon,
       finlog: fl,
       _balanceSource: 'manager',
       updatedAt: new Date().toISOString()
-    }, {merge:true}).catch(function(e){ console.warn('adDeleteFinlog:', e); });
+    }).catch(function(e){ console.warn('adDeleteFinlog:', e); });
   }
   adRenderFinlog();
   adRefreshBadges();
@@ -9357,7 +9353,7 @@ function pcSetPrice() {
       symConfig[_scIdx].priceOffset = _newOffset;
       try{ localStorage.setItem('tx_syms', JSON.stringify(symConfig)); }catch(e){}
       if(typeof db!=='undefined'&&db){
-        db.collection('broker').doc('symbols').set({data:JSON.stringify(symConfig),_ts:Date.now()},{merge:true}).catch(function(){});
+        saveSymConfig();   // 2026-11-05: piyasa saati bağlarını koruyan ortak kayıt
       }
     }
     // Hemen uygula
@@ -9542,7 +9538,7 @@ function pcClearOverride(sym) {
       symConfig[_idx].priceOffset = 0;
       try{localStorage.setItem('tx_syms',JSON.stringify(symConfig));}catch(e){}
       if(typeof db!=='undefined'&&db){
-        db.collection('broker').doc('symbols').set({data:JSON.stringify(symConfig),_ts:Date.now()},{merge:true}).catch(function(){});
+        saveSymConfig();   // 2026-11-05: piyasa saati bağlarını koruyan ortak kayıt
       }
     }
   }
@@ -12847,6 +12843,75 @@ function adOpenTrade(btn){
 // bakın). Bu yüzden 'positions' alanını artık HİÇ yazmıyor — açık
 // pozisyonlarla hiç ilgisi olmayan bir işlem için onları toptan yeniden
 // yazıp canlı stop-out motoruyla yarışma riski yaratmasın diye.
+
+// ══════════════════════════════════════════════════════════════════════
+// 2026-11-05: GÜVENLİ BAKİYE / FİNANS YAZIMI
+// Eskiden para yatırma/çekme/bonus/finans düzenleme, bu tarayıcıdaki ÖNBELLEK bakiyeyi
+// alıp üzerine ekleyerek MUTLAK değer yazıyordu. Önbellek o an güncel değilse (müşteri
+// işlem kapattı, sunucu stop-out/swap işledi, başka yönetici aynı anda işlem yaptı, sayfa
+// yeni açıldı ve veri henüz gelmedi → 0) müşterinin K/Z'si veya diğer işlemler SİLİNİYORDU.
+// Artık: önbelleğe göre yapılan DEĞİŞİKLİK (fark) hesaplanır ve sunucudaki GÜNCEL değere
+// transaction içinde uygulanır. Finans kayıtları da toptan değil, eklenen/silinen kayıt
+// bazında işlenir.
+// ══════════════════════════════════════════════════════════════════════
+function _adFlKey(e){ return e ? [e.type, e.amount, e.date, e.note||''].join('|') : ''; }
+function _adCanonWrite(accId, patch){
+  var id = String(accId);
+  var c = _accCanon[id];
+  if(!c || !c.ready){
+    showAdminToast && showAdminToast('Bekleyin','Hesap verisi henüz yüklenmedi — birkaç saniye sonra tekrar deneyin','warning');
+    return Promise.reject(new Error('canon not ready'));
+  }
+  var baseBal = c.balance||0, baseBon = c.bonus||0;
+  var baseFl = Array.isArray(c.finlog) ? c.finlog : [];
+  var dBal = (patch.balance !== undefined) ? (parseFloat(patch.balance)||0) - baseBal : 0;
+  var dBon = (patch.bonus   !== undefined) ? (parseFloat(patch.bonus)||0)   - baseBon : 0;
+  var added = [], removed = {}, addFront = false;
+  if(Array.isArray(patch.finlog)){
+    var bk = {}; baseFl.forEach(function(e){ var k=_adFlKey(e); bk[k]=(bk[k]||0)+1; });
+    var nk = {}; patch.finlog.forEach(function(e){ var k=_adFlKey(e); nk[k]=(nk[k]||0)+1; });
+    patch.finlog.forEach(function(e,i){ var k=_adFlKey(e); if((bk[k]||0) > 0){ bk[k]--; } else { added.push(e); if(i===0) addFront = true; } });
+    Object.keys(bk).forEach(function(k){ if(bk[k]>0) removed[k]=bk[k]; });
+  }
+  var extra = {}; Object.keys(patch).forEach(function(k){ if(['balance','bonus','finlog'].indexOf(k)<0) extra[k]=patch[k]; });
+  var ref = db.collection('users').doc(id);
+  return db.runTransaction(function(tx){
+    return tx.get(ref).then(function(doc){
+      var d = doc.exists ? (doc.data()||{}) : {};
+      var out = Object.assign({}, extra);
+      if(dBal !== 0 || patch.balance !== undefined) out.balance = Math.round(Math.max(0, (parseFloat(d.balance)||0) + dBal)*100)/100;
+      if(dBon !== 0 || patch.bonus !== undefined)   out.bonus   = Math.round(Math.max(0, (parseFloat(d.bonus)||0) + dBon)*100)/100;
+      if(Array.isArray(patch.finlog)){
+        var fl = Array.isArray(d.finlog) ? d.finlog.slice() : [];
+        var rm = Object.assign({}, removed);
+        fl = fl.filter(function(e){ var k=_adFlKey(e); if(rm[k]>0){ rm[k]--; return false; } return true; });
+        if(addFront) fl = added.concat(fl); else fl = fl.concat(added);
+        out.finlog = fl;
+      }
+      tx.set(ref, out, {merge:true});
+    });
+  });
+}
+// Geçmiş kaydı düzenle/sil — yalnız o kayıt + bakiye farkı, sunucudaki güncel veri üzerinde
+function _adHistTx(accId, op){
+  var ref = db.collection('users').doc(String(accId));
+  return db.runTransaction(function(tx){
+    return tx.get(ref).then(function(doc){
+      if(!doc.exists) return;
+      var d = doc.data()||{};
+      var H = d.tradeHistory, hs = false;
+      if(typeof H === 'string'){ hs = true; try{ H = JSON.parse(H||'[]'); }catch(e){ H = []; } }
+      H = Array.isArray(H) ? H.slice() : [];
+      var i = H.findIndex(function(x){ return String(x.id)===String(op.id); });
+      if(i < 0) return;
+      if(op.del) H.splice(i,1); else if(op.entry) H[i] = op.entry;
+      var out = { tradeHistory: hs ? JSON.stringify(H) : H, updatedAt: new Date().toISOString() };
+      if(op.balDelta){ out.balance = Math.round(((parseFloat(d.balance)||0) + op.balDelta)*100)/100; out._balanceSource = 'manager'; }
+      tx.set(ref, out, {merge:true});
+    });
+  });
+}
+
 function adSaveUserTrades(){
   var a = accounts.find(function(x){ return String(x.id)===String(_adAccId); });
   if(!a) return;
@@ -12953,7 +13018,9 @@ function adSaveHistEdit(){
     }
   }
 
-  adSaveUserTrades();
+  // 2026-11-05: tüm geçmişi toptan değil, yalnız bu kaydı sunucuda güncelle
+  _adHistTx(_adAccId, { id: h.id, entry: JSON.parse(JSON.stringify(h)), balDelta: delta })
+    .catch(function(e){ showAdminToast('Hata','Kaydedilemedi: '+e.message,'danger'); });
   adRenderHistoryTable();
   if(typeof adRefreshBadges==='function') try{ adRefreshBadges(); }catch(e){}
   var m = document.getElementById('adHistEditModal'); if(m) m.style.display='none';
@@ -12977,7 +13044,9 @@ function adDeleteHistory(btn){
   }
 
   _adHistory.splice(hidx, 1);
-  adSaveUserTrades();
+  // 2026-11-05: yalnız bu kaydı sil + bakiyeden K/Z'yi düş (sunucudaki güncel bakiye üzerinde)
+  _adHistTx(_adAccId, { id: h.id, del: true, balDelta: -pnl })
+    .catch(function(e){ showAdminToast('Hata','Silinemedi: '+e.message,'danger'); });
   adRenderHistoryTable();
   if(typeof adRefreshBadges==='function') try{ adRefreshBadges(); }catch(e){}
   var m = document.getElementById('adHistEditModal'); if(m) m.style.display='none';
